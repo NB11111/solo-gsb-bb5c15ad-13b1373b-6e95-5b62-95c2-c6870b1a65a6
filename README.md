@@ -4,6 +4,7 @@
 
 - 接收带**唯一事件号**、选手号、站点序号、发生时间的打卡；
 - 支持按事件号**更正**（新事件取代原事件）与**撤销**；
+- 支持**更正预演**：试算更正前后结果，整体回滚，不产生任何副作用；
 - 同一站点多条有效打卡取**最早时间**；
 - 按站点顺序重算相邻站分段用时，**乱序补传**可填补缺段，更正 / 撤销即时更新结果；
 - 相邻站缺打卡或**时间倒退**时，该分段标记为 `pending`（待定）并说明原因；
@@ -36,6 +37,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/checkins` | 登记打卡；携带 `corrects` 字段即为更正指定事件 |
+| `POST` | `/api/checkins/preview-correction` | 预演更正：返回更正前后结果对照，整体回滚、无副作用 |
 | `POST` | `/api/checkins/{event_no}/revoke` | 按事件号撤销打卡 |
 | `GET` | `/api/checkins?runner_id=` | 打卡列表（含已更正 / 已撤销记录） |
 | `GET` | `/api/checkins/{event_no}` | 按事件号查询单条打卡 |
@@ -57,6 +59,41 @@ curl -X POST http://localhost:8000/api/checkins \
 curl -X POST http://localhost:8000/api/checkins \
   -H 'Content-Type: application/json' \
   -d '{"event_no":"E1002","runner_id":"R100","station_seq":1,"occurred_at":"2026-09-25T08:05:00","corrects":"E1001"}'
+```
+
+预演更正（字段与正式更正相同，`corrects` 必填且须指向有效事件）：
+
+```bash
+curl -X POST http://localhost:8000/api/checkins/preview-correction \
+  -H 'Content-Type: application/json' \
+  -d '{"event_no":"E1002","runner_id":"R100","station_seq":1,"occurred_at":"2026-09-25T08:05:00","corrects":"E1001"}'
+```
+
+预演与正式更正使用相同的事件号唯一性、站点范围与状态校验；按现有"同站取最早 + 相邻站"规则
+试算更正前后结果，返回受影响选手各自的完成状态、总用时及**仅发生变化的分段**；更正跨选手时
+会同时覆盖原选手与新选手。整个预演在事务内试算后**整体回滚**：不占用事件号、不改变打卡状态
+或成绩，相同请求随后可原样正式提交。响应节选：
+
+```json
+{
+  "event_no": "E1002",
+  "corrects": "E1001",
+  "affected_runners": [
+    {
+      "runner_id": "R100",
+      "before": {"complete": false, "total_seconds": null, "total": null},
+      "after": {"complete": true, "total_seconds": 12600, "total": "3:30:00"},
+      "changed_segments": [
+        {
+          "from_station": 1,
+          "to_station": 2,
+          "before": {"from_station": 1, "to_station": 2, "status": "pending", "reason": "站点 1 缺少有效打卡"},
+          "after": {"from_station": 1, "to_station": 2, "status": "ok", "duration_seconds": 1920, "duration": "0:32:00"}
+        }
+      ]
+    }
+  ]
+}
 ```
 
 撤销：
@@ -99,4 +136,5 @@ pytest                               # 运行测试
 - 打卡记录永久保留，更正 / 撤销只改变状态（`active` / `superseded` / `revoked`），便于审计；
 - 分段结果在查询时基于全部有效打卡实时重算，因此补传、更正、撤销立即反映到结果中；
 - 时间统一归一化为 UTC 存储，无时区的时间按 UTC 处理；
-- 更正与写入在同一事务中完成，事件号唯一性由数据库主键保证（重复返回 409）。
+- 更正与写入在同一事务中完成，事件号唯一性由数据库主键保证（重复返回 409）；
+- 更正预演复用正式更正的校验与写入逻辑，在 `SAVEPOINT` 内试算后 `ROLLBACK TO` 整体回滚，对数据库零副作用。

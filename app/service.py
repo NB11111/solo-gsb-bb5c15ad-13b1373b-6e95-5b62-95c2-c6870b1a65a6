@@ -1,4 +1,4 @@
-"""核心业务逻辑：打卡写入 / 更正 / 撤销 / 分段重算。"""
+"""核心业务逻辑：打卡写入 / 更正 / 撤销 / 分段重算 / 更正预演。"""
 from __future__ import annotations
 
 import os
@@ -7,7 +7,18 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
-from .models import CheckinCreate, CheckinOut, Segment, SplitsOut, StationTime
+from .models import (
+    CheckinCreate,
+    CheckinOut,
+    CorrectionPreview,
+    PreviewCorrectionOut,
+    RunnerPreview,
+    RunnerSummary,
+    Segment,
+    SegmentChange,
+    SplitsOut,
+    StationTime,
+)
 
 ACTIVE = "active"
 SUPERSEDED = "superseded"
@@ -56,8 +67,13 @@ def _get_row(conn: sqlite3.Connection, event_no: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def create_checkin(conn: sqlite3.Connection, payload: CheckinCreate) -> CheckinOut:
-    """登记打卡；携带 corrects 时视为更正，原事件被取代。"""
+def _validate_payload(
+    conn: sqlite3.Connection, payload: CheckinCreate
+) -> sqlite3.Row | None:
+    """登记与预演共用的校验：站点范围、事件号唯一性、corrects 目标存在且有效。
+
+    返回被更正的原事件行；payload 未携带 corrects 时返回 None。
+    """
     count = station_count()
     if payload.station_seq > count:
         raise HTTPException(
@@ -67,6 +83,7 @@ def create_checkin(conn: sqlite3.Connection, payload: CheckinCreate) -> CheckinO
     if _get_row(conn, payload.event_no) is not None:
         raise HTTPException(status_code=409, detail=f"事件号 {payload.event_no} 已存在")
 
+    origin = None
     if payload.corrects is not None:
         origin = _get_row(conn, payload.corrects)
         if origin is None:
@@ -79,29 +96,44 @@ def create_checkin(conn: sqlite3.Connection, payload: CheckinCreate) -> CheckinO
                 detail=f"事件 {payload.corrects} 状态为 {origin['status']}，不能更正；"
                 "请更正当前有效的替代事件",
             )
+    return origin
 
+
+def _insert_correction(
+    conn: sqlite3.Connection,
+    payload: CheckinCreate,
+    occurred: datetime,
+    created: datetime,
+) -> None:
+    """在当前事务内执行更正写入：原事件置为 superseded 并插入新事件。"""
+    if payload.corrects is not None:
+        conn.execute(
+            "UPDATE checkins SET status = ? WHERE event_no = ?",
+            (SUPERSEDED, payload.corrects),
+        )
+    conn.execute(
+        "INSERT INTO checkins"
+        " (event_no, runner_id, station_seq, occurred_at, status, corrects, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            payload.event_no,
+            payload.runner_id,
+            payload.station_seq,
+            occurred.isoformat(),
+            ACTIVE,
+            payload.corrects,
+            created.isoformat(),
+        ),
+    )
+
+
+def create_checkin(conn: sqlite3.Connection, payload: CheckinCreate) -> CheckinOut:
+    """登记打卡；携带 corrects 时视为更正，原事件被取代。"""
+    _validate_payload(conn, payload)
     occurred = _to_utc(payload.occurred_at)
     created = _now()
     with conn:  # 事务：更正与写入同时成功或失败
-        if payload.corrects is not None:
-            conn.execute(
-                "UPDATE checkins SET status = ? WHERE event_no = ?",
-                (SUPERSEDED, payload.corrects),
-            )
-        conn.execute(
-            "INSERT INTO checkins"
-            " (event_no, runner_id, station_seq, occurred_at, status, corrects, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                payload.event_no,
-                payload.runner_id,
-                payload.station_seq,
-                occurred.isoformat(),
-                ACTIVE,
-                payload.corrects,
-                created.isoformat(),
-            ),
-        )
+        _insert_correction(conn, payload, occurred, created)
     return CheckinOut(
         event_no=payload.event_no,
         runner_id=payload.runner_id,
@@ -161,18 +193,22 @@ def list_checkins(
 
 
 def get_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
+    """按站点顺序重算某选手的相邻站分段用时（详见 _compute_splits）。"""
+    any_row = conn.execute(
+        "SELECT 1 FROM checkins WHERE runner_id = ? LIMIT 1", (runner_id,)
+    ).fetchone()
+    if any_row is None:
+        raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
+    return _compute_splits(conn, runner_id)
+
+
+def _compute_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
     """按站点顺序重算某选手的相邻站分段用时。
 
     - 仅统计 status='active' 的打卡；同站多条有效打卡取最早时间；
     - 相邻站缺打卡或时间倒退的分段标记为 pending 并说明原因；
     - 每次查询都基于最新数据重算，因此补传、更正、撤销即时生效。
     """
-    any_row = conn.execute(
-        "SELECT 1 FROM checkins WHERE runner_id = ? LIMIT 1", (runner_id,)
-    ).fetchone()
-    if any_row is None:
-        raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
-
     rows = conn.execute(
         "SELECT * FROM checkins WHERE runner_id = ? AND status = ?",
         (runner_id, ACTIVE),
@@ -250,4 +286,70 @@ def get_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
         total=_fmt_duration(total_seconds) if total_seconds is not None else None,
         stations=stations,
         segments=segments,
+    )
+
+
+def _summary(splits: SplitsOut) -> RunnerSummary:
+    return RunnerSummary(
+        complete=splits.complete,
+        total_seconds=splits.total_seconds,
+        total=splits.total,
+    )
+
+
+def preview_correction(
+    conn: sqlite3.Connection, payload: CorrectionPreview
+) -> PreviewCorrectionOut:
+    """预演更正：与正式更正相同的校验和写入逻辑，但整体回滚。
+
+    在 SAVEPOINT 内模拟"原事件被取代 + 新事件生效"，按现有同站最早与
+    相邻站规则重算受影响选手（跨选手时含原选手与新选手）的更正前后结果，
+    随后回滚：不占用事件号、不改变打卡状态或成绩，相同请求随后可正式提交。
+    """
+    origin = _validate_payload(conn, payload)  # corrects 必填，origin 必非 None
+
+    runner_ids = [origin["runner_id"]]
+    if payload.runner_id not in runner_ids:
+        runner_ids.append(payload.runner_id)
+
+    before = {rid: _compute_splits(conn, rid) for rid in runner_ids}
+
+    occurred = _to_utc(payload.occurred_at)
+    conn.execute("SAVEPOINT preview_correction")
+    try:
+        _insert_correction(conn, payload, occurred, _now())
+        after = {rid: _compute_splits(conn, rid) for rid in runner_ids}
+    finally:
+        conn.execute("ROLLBACK TO SAVEPOINT preview_correction")
+        conn.execute("RELEASE SAVEPOINT preview_correction")
+
+    affected = []
+    for rid in runner_ids:
+        b, a = before[rid], after[rid]
+        changes = [
+            SegmentChange(
+                from_station=seg_b.from_station,
+                to_station=seg_b.to_station,
+                before=seg_b,
+                after=seg_a,
+            )
+            for seg_b, seg_a in zip(b.segments, a.segments)
+            if (seg_b.status, seg_b.duration_seconds, seg_b.reason)
+            != (seg_a.status, seg_a.duration_seconds, seg_a.reason)
+        ]
+        affected.append(
+            RunnerPreview(
+                runner_id=rid,
+                before=_summary(b),
+                after=_summary(a),
+                changed_segments=changes,
+            )
+        )
+    return PreviewCorrectionOut(
+        event_no=payload.event_no,
+        runner_id=payload.runner_id,
+        station_seq=payload.station_seq,
+        occurred_at=occurred,
+        corrects=payload.corrects,
+        affected_runners=affected,
     )
